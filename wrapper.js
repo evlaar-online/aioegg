@@ -24,18 +24,19 @@ const seenPercentage = {};
 
 function filter(data) {
     const str = data.toString();
-    if(str.startsWith("Fallback handler could not load library")) return; // Remove fallback
-    if(str.includes("Filename:")) return; //Remove bindings.h
-	if(str.includes("ERROR: Shader ")) return; //Remove shader errors
-	if(str.includes("WARNING: Shader ")) return; //Remove shader errors
+    if(str.startsWith("Fallback handler could not load library")) return null; // Remove fallback
+    if(str.includes("Filename:")) return null; //Remove bindings.h
+	if(str.includes("ERROR: Shader ")) return null; //Remove shader errors
+	if(str.includes("WARNING: Shader ")) return null; //Remove shader errors
     if (str.startsWith("Loading Prefab Bundle ")) { // Rust seems to spam the same percentage, so filter out any duplicates.
         const percentage = str.substr("Loading Prefab Bundle ".length);
-        if (seenPercentage[percentage]) return;
+        if (seenPercentage[percentage]) return null;
 
         seenPercentage[percentage] = true;
     }
 
     console.log(str);
+    return str;
 }
 
 const { spawn } = require("child_process");
@@ -95,12 +96,61 @@ if (_monoLogging) {
     }
 }
 
+// True until RCON is delivering the same console lines. While false, onGameOutput
+// still drains the pipes (and mono log) but must not print to the panel.
+let forwardGameOutput = true;
+const recentConsoleLines = new Map();
+const DEDUPE_MS = 1000;
+
+function rememberConsoleLines(text) {
+    const now = Date.now();
+    const lines = String(text).split(/\r?\n/);
+    for (const line of lines) {
+        if (!line) continue;
+        recentConsoleLines.set(line, now);
+    }
+    if (recentConsoleLines.size > 500) {
+        for (const [line, at] of recentConsoleLines) {
+            if (now - at > DEDUPE_MS) recentConsoleLines.delete(line);
+        }
+    }
+}
+
+function isRecentDuplicate(text) {
+    const now = Date.now();
+    const lines = String(text).split(/\r?\n/).filter((line) => line.length > 0);
+    if (lines.length === 0) return true;
+    return lines.every((line) => {
+        const at = recentConsoleLines.get(line);
+        return at !== undefined && now - at < DEDUPE_MS;
+    });
+}
+
 function onGameOutput(data) {
     if (monoLogStream) monoLogStream.write(data);
-    filter(data);
+    if (!forwardGameOutput) return;
+    const printed = filter(data);
+    if (printed) rememberConsoleLines(printed);
 }
-gameProcess.stdout.on('data', onGameOutput);
-gameProcess.stderr.on('data', onGameOutput);
+
+function watchGameOutput(stream) {
+    if (!stream) return;
+    stream.on('data', onGameOutput);
+}
+
+// Drop every data listener, including any anonymous one removeListener(filter)
+// would leave in place, then keep a single non-printing drain.
+function silenceGameOutput() {
+    forwardGameOutput = false;
+    for (const stream of [gameProcess.stdout, gameProcess.stderr]) {
+        if (!stream) continue;
+        stream.removeAllListeners('data');
+        stream.on('data', onGameOutput);
+    }
+}
+
+watchGameOutput(gameProcess.stdout);
+watchGameOutput(gameProcess.stderr);
 gameProcess.on('exit', function (code, signal) {
 	exited = true;
 
@@ -132,17 +182,24 @@ process.on('exit', function (code) {
 	gameProcess.kill('SIGTERM');
 });
 
-var waiting = true;
-var poll = function () {
-	function createPacket(command) {
-		var packet = {
-			Identifier: -1,
-			Message: command,
-			Name: "WebRcon"
-		};
-		return JSON.stringify(packet);
-	}
+function createPacket(command) {
+	var packet = {
+		Identifier: -1,
+		Message: command,
+		Name: "WebRcon"
+	};
+	return JSON.stringify(packet);
+}
 
+var waiting = true;
+var consoleSocket = null;
+var retryTimer = null;
+var attemptId = 0;
+var stdinHooked = false;
+var poll = function () {
+	if (consoleSocket && consoleSocket.readyState === 1) return;
+
+	var myId = ++attemptId;
 	var serverHostname = process.env.RCON_IP ? process.env.RCON_IP : "localhost";
 	var serverPort = process.env.RCON_PORT;
 	var serverPassword = process.env.RCON_PASS;
@@ -150,6 +207,14 @@ var poll = function () {
 	var ws = new WebSocket("ws://" + serverHostname + ":" + serverPort + "/" + serverPassword);
 
 	ws.on("open", function open() {
+		if (myId !== attemptId) {
+			try { ws.close(); } catch (e) {}
+			return;
+		}
+		consoleSocket = ws;
+		// Stop process output before any RCON line is logged, so the two paths
+		// cannot both print the same Rust line.
+		silenceGameOutput();
 		console.log("Connected to RCON. Generating the map now. Please wait until the server status switches to \"Running\".");
 		waiting = false;
 
@@ -157,19 +222,26 @@ var poll = function () {
 		ws.send(createPacket('status'));
 
 		process.stdin.removeListener('data', initialListener);
-		gameProcess.stdout.removeListener('data', onGameOutput);
-		gameProcess.stderr.removeListener('data', onGameOutput);
-		process.stdin.on('data', function (text) {
-			ws.send(createPacket(text));
-		});
+		if (!stdinHooked) {
+			stdinHooked = true;
+			process.stdin.on('data', function (text) {
+				if (consoleSocket && consoleSocket.readyState === 1) {
+					consoleSocket.send(createPacket(text));
+				}
+			});
+		}
 	});
 
 	ws.on("message", function (data, flags) {
+		if (ws !== consoleSocket) return;
 		try {
 			var json = JSON.parse(data);
 			if (json !== undefined) {
 				if (json.Message !== undefined && json.Message.length > 0) {
-					console.log(json.Message);
+					if (!isRecentDuplicate(json.Message)) {
+						console.log(json.Message);
+						rememberConsoleLines(json.Message);
+					}
 					const fs = require("fs");
 					fs.appendFile("latest.log", "\n" + json.Message, (err) => {
 						if (err) console.log("Callback error in appendFile:" + err);
@@ -186,12 +258,18 @@ var poll = function () {
 	});
 
 	ws.on("error", function (err) {
+		if (myId !== attemptId || consoleSocket === ws) return;
 		waiting = true;
 		console.log("Waiting for RCON to come up...");
-		setTimeout(poll, 5000);
+		if (retryTimer) clearTimeout(retryTimer);
+		retryTimer = setTimeout(function () {
+			retryTimer = null;
+			poll();
+		}, 5000);
 	});
 
 	ws.on("close", function () {
+		if (ws !== consoleSocket) return;
 		if (!waiting) {
 			console.log("Connection to server closed.");
 
