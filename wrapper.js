@@ -2,13 +2,14 @@
 
 var startupCmd = "";
 const fs = require("fs");
-const { createPanelWriter } = require("./wrapper-helpers");
+const { createPanelRouter } = require("./wrapper-helpers");
 let rconActive = false;
-const writePanel = createPanelWriter(
+const panel = createPanelRouter(
 	(text) => console.log(text),
 	() => rconActive,
-	1000
+	1500
 );
+const writePanel = panel.status;
 fs.writeFile("latest.log", "", (err) => {
 	if (err) writePanel("Callback error in writeFile: " + err);
 });
@@ -103,44 +104,31 @@ if (_monoLogging) {
     }
 }
 
-// Child output is the sole panel source until the first RCON connection.
-// Afterwards these pipes stay drained permanently; RCON is the sole source.
-let forwardGameOutput = true;
-let pendingStdout = "";
-
-function onGameOutput(data) {
-    if (monoLogStream) monoLogStream.write(data);
-    if (!forwardGameOutput) return;
-    pendingStdout += data.toString();
-    let nl = pendingStdout.indexOf("\n");
-    while (nl !== -1) {
-        const line = pendingStdout.slice(0, nl);
-        pendingStdout = pendingStdout.slice(nl + 1);
-        const filtered = filterLine(line);
-        if (filtered != null) writePanel(filtered);
-        nl = pendingStdout.indexOf("\n");
-    }
+// Each piped child stream gets exactly one permanent handler. Once RCON has
+// opened, the handlers continue draining (and optional file logging) but can
+// never write to the panel.
+function createGameOutputHandler() {
+    let pending = "";
+    return function onGameOutput(data) {
+        if (monoLogStream) monoLogStream.write(data);
+        if (rconActive) {
+            pending = "";
+            return;
+        }
+        pending += data.toString();
+        let nl = pending.indexOf("\n");
+        while (nl !== -1) {
+            const line = pending.slice(0, nl);
+            pending = pending.slice(nl + 1);
+            const filtered = filterLine(line);
+            if (filtered != null) panel.process(filtered);
+            nl = pending.indexOf("\n");
+        }
+    };
 }
 
-function drainGameOutput(data) {
-    if (monoLogStream) monoLogStream.write(data);
-}
-
-function watchGameOutput(stream, handler) {
-    if (!stream) return;
-    stream.removeAllListeners("data");
-    stream.on("data", handler);
-}
-
-function silenceGameOutput() {
-    forwardGameOutput = false;
-    pendingStdout = "";
-    watchGameOutput(gameProcess.stdout, drainGameOutput);
-    watchGameOutput(gameProcess.stderr, drainGameOutput);
-}
-
-watchGameOutput(gameProcess.stdout, onGameOutput);
-watchGameOutput(gameProcess.stderr, onGameOutput);
+gameProcess.stdout.on("data", createGameOutputHandler());
+gameProcess.stderr.on("data", createGameOutputHandler());
 gameProcess.on('exit', function (code, signal) {
 	exited = true;
 	stopRconLifecycle();
@@ -306,7 +294,6 @@ var poll = function () {
 		dialing = false;
 		consoleSocket = ws;
 		rconActive = true;
-		silenceGameOutput();
 		retryWarningShown = false;
 		if (!connectedOnce) {
 			connectedOnce = true;
@@ -337,7 +324,7 @@ var poll = function () {
 		for (var p = 0; p < payloads.length; p++) {
 			var json = payloads[p];
 			if (!json || typeof json.Message !== "string" || json.Message.length === 0) continue;
-			writePanel(json.Message);
+			panel.rcon(json.Message);
 			fs.appendFile("latest.log", "\n" + json.Message, function (err) {
 				if (err) writePanel("Callback error in appendFile: " + err);
 			});
