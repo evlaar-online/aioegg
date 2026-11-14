@@ -2,8 +2,15 @@
 
 var startupCmd = "";
 const fs = require("fs");
+const { createPanelWriter } = require("./wrapper-helpers");
+let rconActive = false;
+const writePanel = createPanelWriter(
+	(text) => console.log(text),
+	() => rconActive,
+	1000
+);
 fs.writeFile("latest.log", "", (err) => {
-	if (err) console.log("Callback error in appendFile:" + err);
+	if (err) writePanel("Callback error in writeFile: " + err);
 });
 
 var args = process.argv.splice(process.execArgv.length + 2);
@@ -16,7 +23,7 @@ for (var i = 0; i < args.length; i++) {
 }
 
 if (startupCmd.length < 1) {
-	console.log("Error: Please specify a startup command.");
+	writePanel("Error: Please specify a startup command.");
 	process.exit();
 }
 
@@ -40,7 +47,7 @@ function filterLine(line) {
 }
 
 const { spawn } = require("child_process");
-console.log("Starting Rust...");
+writePanel("Starting Rust...");
 
 // Networking/runtime mitigations for Mono/Unity
 // - Disable IPv6 in Mono to avoid dual-stack socket issues on some hosts
@@ -92,48 +99,14 @@ if (_monoLogging) {
     try {
         monoLogStream = fs.createWriteStream('/home/container/mono-debug.log', { flags: 'a' });
     } catch (e) {
-        console.log('Failed to open mono-debug.log for writing: ' + (e?.message || e));
+        writePanel('Failed to open mono-debug.log for writing: ' + (e?.message || e));
     }
 }
 
-// True until RCON is delivering game lines. While false, the pipes are drained
-// and not written to the panel. A dropped socket turns this back on so map
-// generation stays visible, then the next open silences it again.
+// Child output is the sole panel source until the first RCON connection.
+// Afterwards these pipes stay drained permanently; RCON is the sole source.
 let forwardGameOutput = true;
 let pendingStdout = "";
-const recentConsoleLines = new Map();
-// Rust sends the same line again inside a later multi-line RCON payload.
-// Reprinting that whole payload is what doubled Spawning World, the track
-// burst, Finalizing World, and the Chaos check. Suppress a line already shown.
-const DEDUPE_MS = 10000;
-
-function lineKey(line) {
-    return String(line).replace(/\u001b\[[0-9;]*m/g, "").replace(/\r/g, "").trim();
-}
-
-function emitConsoleLines(text) {
-    const now = Date.now();
-    const fresh = [];
-    const parts = String(text).split("\n");
-    for (const part of parts) {
-        const display = String(part).replace(/\r/g, "");
-        const key = lineKey(display);
-        if (!key) continue;
-        const at = recentConsoleLines.get(key);
-        if (at !== undefined && now - at < DEDUPE_MS) continue;
-        recentConsoleLines.set(key, now);
-        fresh.push(display);
-    }
-    if (recentConsoleLines.size > 500) {
-        for (const [key, at] of recentConsoleLines) {
-            if (now - at > DEDUPE_MS) recentConsoleLines.delete(key);
-        }
-    }
-    if (!fresh.length) return "";
-    const shown = fresh.join("\n");
-    console.log(shown);
-    return shown;
-}
 
 function onGameOutput(data) {
     if (monoLogStream) monoLogStream.write(data);
@@ -144,7 +117,7 @@ function onGameOutput(data) {
         const line = pendingStdout.slice(0, nl);
         pendingStdout = pendingStdout.slice(nl + 1);
         const filtered = filterLine(line);
-        if (filtered != null) emitConsoleLines(filtered);
+        if (filtered != null) writePanel(filtered);
         nl = pendingStdout.indexOf("\n");
     }
 }
@@ -166,30 +139,19 @@ function silenceGameOutput() {
     watchGameOutput(gameProcess.stderr, drainGameOutput);
 }
 
-function resumeGameOutput() {
-    if (forwardGameOutput) return;
-    forwardGameOutput = true;
-    pendingStdout = "";
-    watchGameOutput(gameProcess.stdout, onGameOutput);
-    watchGameOutput(gameProcess.stderr, onGameOutput);
-}
-
 watchGameOutput(gameProcess.stdout, onGameOutput);
 watchGameOutput(gameProcess.stderr, onGameOutput);
 gameProcess.on('exit', function (code, signal) {
 	exited = true;
-	if (retryTimer) {
-		clearTimeout(retryTimer);
-		retryTimer = null;
-	}
+	stopRconLifecycle();
 
-	if (code) {
-		console.log("Main game process exited with code " + code);
-		// process.exit(code);
-	}
+	if (code) writePanel("Main game process exited with code " + code);
+	else if (signal) writePanel("Main game process exited from signal " + signal);
     if (monoLogStream) {
         try { monoLogStream.end(); } catch {}
     }
+	process.stdin.pause();
+	process.exitCode = typeof code === "number" ? code : 1;
 });
 
 function initialListener(data) {
@@ -197,7 +159,7 @@ function initialListener(data) {
 	if (command === 'quit') {
 		gameProcess.kill('SIGTERM');
 	} else {
-		console.log('Unable to run "' + command + '" due to RCON not being connected yet.');
+		writePanel('Unable to run "' + command + '" due to RCON not being connected yet.');
 	}
 }
 process.stdin.resume();
@@ -207,7 +169,7 @@ process.stdin.on('data', initialListener);
 process.on('exit', function (code) {
 	if (exited) return;
 
-	console.log("Received request to stop the process, stopping the game...");
+	writePanel("Received request to stop the process, stopping the game...");
 	gameProcess.kill('SIGTERM');
 });
 
@@ -220,13 +182,29 @@ function createPacket(command) {
 	return JSON.stringify(packet);
 }
 
-var waiting = true;
 var consoleSocket = null;
+var activeSocket = null;
 var retryTimer = null;
 var attemptId = 0;
 var stdinHooked = false;
 var dialing = false;
 var connectedOnce = false;
+var retryWarningShown = false;
+
+function stopRconLifecycle() {
+	attemptId++;
+	dialing = false;
+	if (retryTimer) {
+		clearTimeout(retryTimer);
+		retryTimer = null;
+	}
+	var socket = activeSocket;
+	activeSocket = null;
+	consoleSocket = null;
+	if (!socket) return;
+	try { socket.removeAllListeners(); } catch (e) {}
+	try { socket.terminate(); } catch (e) {}
+}
 
 function splitJsonObjects(text) {
 	var out = [];
@@ -269,14 +247,13 @@ function payloadsFromFrame(data) {
 		return one === undefined ? [] : [one];
 	} catch (e) {
 		var parts = splitJsonObjects(text);
-		if (!parts.length && e) console.log(e);
+		if (!parts.length && e) writePanel("Invalid RCON payload: " + e.message);
 		return parts;
 	}
 }
 
 var poll = function () {
-	if (dialing) return;
-	if (consoleSocket && (consoleSocket.readyState === 0 || consoleSocket.readyState === 1)) return;
+	if (exited || dialing || activeSocket) return;
 
 	dialing = true;
 	var myId = ++attemptId;
@@ -285,12 +262,11 @@ var poll = function () {
 	var serverPassword = process.env.RCON_PASS;
 	var WebSocket = require("ws");
 	var ws = new WebSocket("ws://" + serverHostname + ":" + serverPort + "/" + serverPassword);
+	activeSocket = ws;
 	var finished = false;
 	var errorTimer = null;
 
-	// A dropped socket must not exit the wrapper. Exit code 0 is what made the
-	// panel restart Rust during map generation. Reconnect on this socket only.
-	function finish(liveClose) {
+	function finish(wasConnected) {
 		if (finished) return;
 		finished = true;
 		dialing = false;
@@ -298,46 +274,46 @@ var poll = function () {
 			clearTimeout(errorTimer);
 			errorTimer = null;
 		}
-		try { ws.removeAllListeners("message"); } catch (e) {}
+		try { ws.removeAllListeners(); } catch (e) {}
+		if (activeSocket === ws) activeSocket = null;
 		if (consoleSocket === ws) consoleSocket = null;
 		if (ws.readyState === 0 || ws.readyState === 1) {
-			try { ws.close(); } catch (e) {}
+			try { ws.terminate(); } catch (e) {}
 		}
-		if (exited) return;
-		if (liveClose) {
-			console.log("Connection to server closed.");
-			waiting = true;
-			resumeGameOutput();
-		} else if (myId === attemptId) {
-			waiting = true;
-			console.log("Waiting for RCON to come up...");
+		if (exited || myId !== attemptId) return;
+		if (wasConnected) {
+			if (!retryWarningShown) {
+				retryWarningShown = true;
+				writePanel("RCON disconnected; Rust is still running. Retrying...");
+			}
+		} else {
+			writePanel("Waiting for RCON to come up...");
 		}
-		if (myId !== attemptId) return;
 		if (retryTimer) clearTimeout(retryTimer);
 		retryTimer = setTimeout(function () {
 			retryTimer = null;
 			poll();
-		}, liveClose ? 1000 : 5000);
+		}, wasConnected ? 1000 : 5000);
 	}
 
 	ws.on("open", function open() {
-		if (myId !== attemptId) {
+		if (finished || myId !== attemptId || activeSocket !== ws) {
 			finished = true;
-			try { ws.removeAllListeners("message"); } catch (e) {}
-			try { ws.close(); } catch (e) {}
+			try { ws.removeAllListeners(); } catch (e) {}
+			try { ws.terminate(); } catch (e) {}
 			return;
 		}
 		dialing = false;
 		consoleSocket = ws;
-		// One source after this. Stdout stays drained until the socket drops.
+		rconActive = true;
 		silenceGameOutput();
+		retryWarningShown = false;
 		if (!connectedOnce) {
 			connectedOnce = true;
-			console.log("Connected to RCON. Generating the map now. Please wait until the server status switches to \"Running\".");
+			writePanel("Connected to RCON. Generating the map now. Please wait until the server status switches to \"Running\".");
 		} else {
-			console.log("Reconnected to RCON.");
+			writePanel("Reconnected to RCON.");
 		}
-		waiting = false;
 
 		// Hack to fix broken console output
 		try { ws.send(createPacket("status")); } catch (e) {}
@@ -361,27 +337,26 @@ var poll = function () {
 		for (var p = 0; p < payloads.length; p++) {
 			var json = payloads[p];
 			if (!json || typeof json.Message !== "string" || json.Message.length === 0) continue;
-			var shown = emitConsoleLines(json.Message);
-			if (!shown) continue;
-			fs.appendFile("latest.log", "\n" + shown, function (err) {
-				if (err) console.log("Callback error in appendFile:" + err);
+			writePanel(json.Message);
+			fs.appendFile("latest.log", "\n" + json.Message, function (err) {
+				if (err) writePanel("Callback error in appendFile: " + err);
 			});
 		}
 	});
 
 	ws.on("error", function () {
-		if (finished || (myId !== attemptId && consoleSocket !== ws)) return;
+		if (finished || myId !== attemptId || activeSocket !== ws) return;
 		if (ws.readyState === 1) return;
 		if (errorTimer) clearTimeout(errorTimer);
 		errorTimer = setTimeout(function () {
 			errorTimer = null;
-			if (finished || (myId !== attemptId && consoleSocket !== ws)) return;
+			if (finished || myId !== attemptId || activeSocket !== ws) return;
 			finish(consoleSocket === ws);
 		}, 250);
 	});
 
 	ws.on("close", function () {
-		if (finished || (myId !== attemptId && consoleSocket !== ws)) return;
+		if (finished || myId !== attemptId || activeSocket !== ws) return;
 		if (errorTimer) {
 			clearTimeout(errorTimer);
 			errorTimer = null;
