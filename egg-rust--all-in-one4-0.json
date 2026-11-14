@@ -2,7 +2,7 @@
     "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - PTERODACTYL.IO",
     "meta": {
         "version": "PTDL_v2",
-        "update_url": "https://raw.githubusercontent.com/CucumberSandwich/aioegg/master/egg-rust--all-in-one4-0.json"
+        "update_url": "https://raw.githubusercontent.com/evlaar-online/aioegg/master/egg-rust--all-in-one4-0.json"
     },
     "exported_at": "2025-11-07T00:18:01-07:00",
     "name": "Rust - All In One 4.0",
@@ -12,7 +12,7 @@
         "steam_disk_space"
     ],
     "docker_images": {
-        "ghcr.io/cucumbersandwich/aioegg:production": "ghcr.io/cucumbersandwich/aioegg:production",
+        "ghcr.io/evlaar-online/aioegg:production": "ghcr.io/evlaar-online/aioegg:production",
         "ghcr.io/sturdystubs/aioegg:production": "ghcr.io/sturdystubs/aioegg:production",
         "ghcr.io/sturdystubs/aioegg:staging": "ghcr.io/sturdystubs/aioegg:staging",
         "ghcr.io/sturdystubs/aioegg:beta": "ghcr.io/sturdystubs/aioegg:beta"
