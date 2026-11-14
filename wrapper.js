@@ -4,7 +4,8 @@ var startupCmd = "";
 const fs = require("fs");
 const {
 	createGameOutputHandler,
-	createRconMessageHandler
+	createRconMessageHandler,
+	prepareSqliteCompatibility
 } = require("./wrapper-helpers");
 const writePanel = (text) => console.log(text);
 
@@ -84,9 +85,17 @@ const spawnArgs = usePty
     ? ['-qfec', startupCmd, '/dev/null']
     : ['-lc', startupCmd];
 
+let childEnv;
+try {
+    childEnv = prepareSqliteCompatibility({ env: process.env, write: writePanel });
+} catch (error) {
+    writePanel("Warning: AIO SQLite compatibility setup failed; using official behavior: " + (error?.message || error));
+    childEnv = { ...process.env };
+}
+
 const gameProcess = spawn(spawnCmd, spawnArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: process.env
+    env: childEnv
 });
 // If MONO_LOGGING is enabled, tee raw stdout/stderr to mono-debug.log as a fallback
 let monoLogStream = null;
