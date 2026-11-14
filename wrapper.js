@@ -2,17 +2,11 @@
 
 var startupCmd = "";
 const fs = require("fs");
-const { createPanelRouter } = require("./wrapper-helpers");
-let rconActive = false;
-const panel = createPanelRouter(
-	(text) => console.log(text),
-	() => rconActive,
-	1500
-);
-const writePanel = panel.status;
-fs.writeFile("latest.log", "", (err) => {
-	if (err) writePanel("Callback error in writeFile: " + err);
-});
+const {
+	createGameOutputHandler,
+	createRconMessageHandler
+} = require("./wrapper-helpers");
+const writePanel = (text) => console.log(text);
 
 var args = process.argv.splice(process.execArgv.length + 2);
 for (var i = 0; i < args.length; i++) {
@@ -104,31 +98,10 @@ if (_monoLogging) {
     }
 }
 
-// Each piped child stream gets exactly one permanent handler. Once RCON has
-// opened, the handlers continue draining (and optional file logging) but can
-// never write to the panel.
-function createGameOutputHandler() {
-    let pending = "";
-    return function onGameOutput(data) {
-        if (monoLogStream) monoLogStream.write(data);
-        if (rconActive) {
-            pending = "";
-            return;
-        }
-        pending += data.toString();
-        let nl = pending.indexOf("\n");
-        while (nl !== -1) {
-            const line = pending.slice(0, nl);
-            pending = pending.slice(nl + 1);
-            const filtered = filterLine(line);
-            if (filtered != null) panel.process(filtered);
-            nl = pending.indexOf("\n");
-        }
-    };
-}
-
-gameProcess.stdout.on("data", createGameOutputHandler());
-gameProcess.stderr.on("data", createGameOutputHandler());
+// Child stdout/stderr are the sole source of game output in the panel. Each
+// stream has exactly one permanent listener for the lifetime of the process.
+gameProcess.stdout.on("data", createGameOutputHandler(writePanel, filterLine, () => monoLogStream));
+gameProcess.stderr.on("data", createGameOutputHandler(writePanel, filterLine, () => monoLogStream));
 gameProcess.on('exit', function (code, signal) {
 	exited = true;
 	stopRconLifecycle();
@@ -240,6 +213,8 @@ function payloadsFromFrame(data) {
 	}
 }
 
+const handleRconMessage = createRconMessageHandler(payloadsFromFrame);
+
 var poll = function () {
 	if (exited || dialing || activeSocket) return;
 
@@ -293,7 +268,6 @@ var poll = function () {
 		}
 		dialing = false;
 		consoleSocket = ws;
-		rconActive = true;
 		retryWarningShown = false;
 		if (!connectedOnce) {
 			connectedOnce = true;
@@ -320,15 +294,9 @@ var poll = function () {
 
 	ws.on("message", function (data) {
 		if (ws !== consoleSocket) return;
-		var payloads = payloadsFromFrame(data);
-		for (var p = 0; p < payloads.length; p++) {
-			var json = payloads[p];
-			if (!json || typeof json.Message !== "string" || json.Message.length === 0) continue;
-			panel.rcon(json.Message);
-			fs.appendFile("latest.log", "\n" + json.Message, function (err) {
-				if (err) writePanel("Callback error in appendFile: " + err);
-			});
-		}
+		// Parse frames to validate RCON traffic, but never mirror game payloads.
+		// Rust child stdout/stderr already provide the panel's complete game log.
+		handleRconMessage(data);
 	});
 
 	ws.on("error", function () {

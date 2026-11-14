@@ -2,74 +2,68 @@
 
 const assert = require("assert");
 const fs = require("fs");
-const { createPanelRouter, normalizePanelLine } = require("./wrapper-helpers");
+const {
+	createGameOutputHandler,
+	createRconMessageHandler
+} = require("./wrapper-helpers");
 
-let active = false;
-let timestamp = 0;
 const output = [];
-const panel = createPanelRouter(
+const childOutput = createGameOutputHandler(
 	(text) => output.push(text),
-	() => active,
-	1500,
-	() => timestamp
+	(line) => line.replace(/\r/g, ""),
+	() => null
 );
 
-// Wrapper status repeats remain visible before RCON.
-panel.status("Waiting for RCON");
-panel.status("Waiting for RCON");
-assert.deepStrictEqual(output, ["Waiting for RCON", "Waiting for RCON"]);
-
-// Exercise the actual process-to-RCON handoff routes. The decorated child copy
-// wins if it arrives first; the matching plain RCON copy is suppressed.
-timestamp = 100;
-panel.process("\u001b[2K\u001b[32m[4.1s] Spawning World\u001b[0m");
-active = true;
-timestamp = 110;
-panel.rcon("Spawning World");
-assert.deepStrictEqual(output.slice(2), [
-	"\u001b[2K\u001b[32m[4.1s] Spawning World\u001b[0m"
+// Child output is printed once and genuine repeated lines remain repeated.
+childOutput(Buffer.from("Spawning World\n"));
+assert.deepStrictEqual(output, ["Spawning World"]);
+childOutput(Buffer.from("Processing World\nProcessing World\n"));
+assert.deepStrictEqual(output, [
+	"Spawning World",
+	"Processing World",
+	"Processing World"
 ]);
 
-// Process pipes only drain after RCON; the RCON route remains the sole writer.
-timestamp = 200;
-panel.process("\u001b[33mTerrain Mesh\u001b[0m");
-panel.rcon("Terrain Mesh");
-assert.strictEqual(output.at(-1), "Terrain Mesh");
+// Split child chunks still produce one panel line.
+childOutput(Buffer.from("Finalizing "));
+childOutput(Buffer.from("World\n"));
+assert.strictEqual(output.at(-1), "Finalizing World");
 
-// Repeated blocks suppress each pair's second copy without losing distinct lines.
-timestamp = 300;
-panel.rcon("Train Track Collation\nProcessing World\nGenerated ocean patrol path");
-timestamp = 350;
-panel.rcon(
-	"[0.3s] Train Track Collation\n" +
-	"12:34:56 Processing World\n" +
-	"[stdout] Generated ocean patrol path\n" +
-	"Ocean Patrol Paths"
-);
-assert.strictEqual(
-	output.at(-1),
-	"Ocean Patrol Paths"
-);
-
-// The same genuine RCON line is allowed after the 1500 ms window.
-timestamp = 1900;
-panel.rcon("Spawning World");
-assert.strictEqual(output.at(-1), "Spawning World");
-
-assert.strictEqual(
-	normalizePanelLine("\u001b]0;title\u0007\u001b[2K\u001b[31m[4.1s] Finalizing World\r\u001b[0m"),
-	"Finalizing World"
-);
+// RCON game messages are parsed but have no panel writer and emit zero lines.
+const beforeRcon = output.length;
+let parsedRcon;
+const rconMessage = createRconMessageHandler((data) => {
+	parsedRcon = JSON.parse(String(data));
+	return [parsedRcon];
+});
+rconMessage(Buffer.from('{"Message":"Spawning World","Identifier":1}'));
+assert.strictEqual(parsedRcon.Message, "Spawning World");
+assert.strictEqual(output.length, beforeRcon);
 
 // Static integration guardrails for the wrapper's actual child and RCON paths.
 const wrapper = fs.readFileSync(require.resolve("./wrapper"), "utf8");
 assert.match(wrapper, /stdio:\s*\[['"]ignore['"],\s*['"]pipe['"],\s*['"]pipe['"]\]/);
 assert.strictEqual(
-	(wrapper.match(/\.on\("data", createGameOutputHandler\(\)\)/g) || []).length,
+	(wrapper.match(/gameProcess\.(?:stdout|stderr)\.on\("data", createGameOutputHandler\(/g) || []).length,
 	2
 );
 assert.doesNotMatch(wrapper, /stdio:\s*["']inherit["']|\.pipe\(process\.(?:stdout|stderr)\)/);
-assert.match(wrapper, /if \(filtered != null\) panel\.process\(filtered\)/);
-assert.match(wrapper, /panel\.rcon\(json\.Message\)/);
+assert.doesNotMatch(wrapper, /json\.Message|panel\.rcon|appendFile\(["']latest\.log|writeFile\(["']latest\.log/);
+
+// RCON close/error only schedule reconnects; they never terminate the wrapper.
+const rconLifecycle = wrapper.slice(
+	wrapper.indexOf("function finish(wasConnected)"),
+	wrapper.lastIndexOf("\npoll();")
+);
+assert.doesNotMatch(rconLifecycle, /process\.exit(?:Code)?\s*=|process\.exit\(/);
+assert.match(rconLifecycle, /setTimeout\(function \(\) \{[\s\S]*poll\(\)/);
+
+// Only the Rust child exit determines the wrapper's resulting exit code.
+const childExit = wrapper.slice(
+	wrapper.indexOf("gameProcess.on('exit'"),
+	wrapper.indexOf("function initialListener")
+);
+assert.match(childExit, /process\.exitCode = typeof code === "number" \? code : 1/);
+assert.strictEqual((wrapper.match(/process\.exitCode\s*=/g) || []).length, 1);
 
 console.log("wrapper helper tests passed");
