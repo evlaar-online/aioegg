@@ -2,9 +2,12 @@
 
 var startupCmd = "";
 const fs = require("fs");
+const readline = require("readline");
 const {
 	createGameOutputHandler,
-	createRconMessageHandler
+	createRconCommandTracker,
+	createRconMessageHandler,
+	createConsoleInputHandler
 } = require("./wrapper-helpers");
 const writePanel = (text) => console.log(text);
 
@@ -111,21 +114,10 @@ gameProcess.on('exit', function (code, signal) {
     if (monoLogStream) {
         try { monoLogStream.end(); } catch {}
     }
+	try { rl.close(); } catch {}
 	process.stdin.pause();
 	process.exitCode = typeof code === "number" ? code : 1;
 });
-
-function initialListener(data) {
-	const command = data.toString().trim();
-	if (command === 'quit') {
-		gameProcess.kill('SIGTERM');
-	} else {
-		writePanel('Unable to run "' + command + '" due to RCON not being connected yet.');
-	}
-}
-process.stdin.resume();
-process.stdin.setEncoding("utf8");
-process.stdin.on('data', initialListener);
 
 process.on('exit', function (code) {
 	if (exited) return;
@@ -134,9 +126,9 @@ process.on('exit', function (code) {
 	gameProcess.kill('SIGTERM');
 });
 
-function createPacket(command) {
+function createPacket(command, identifier) {
 	var packet = {
-		Identifier: -1,
+		Identifier: identifier === undefined ? -1 : identifier,
 		Message: command,
 		Name: "WebRcon"
 	};
@@ -147,10 +139,31 @@ var consoleSocket = null;
 var activeSocket = null;
 var retryTimer = null;
 var attemptId = 0;
-var stdinHooked = false;
 var dialing = false;
 var connectedOnce = false;
 var retryWarningShown = false;
+
+const rconTracker = createRconCommandTracker({
+	ttlMs: 30000,
+	maxPending: 256
+});
+
+// Container PTY /dev/pts/0 runs with -echo (stty ECHO off), so print typed
+// commands explicitly so they remain visible in the Pterodactyl console.
+const handleConsoleLine = createConsoleInputHandler({
+	getSocket: () => consoleSocket,
+	isSocketOpen: (ws) => Boolean(ws && ws.readyState === (ws.OPEN || 1)),
+	tracker: rconTracker,
+	write: writePanel,
+	echoCommand: true,
+	onQuit: () => gameProcess.kill("SIGTERM")
+});
+
+const rl = readline.createInterface({
+	input: process.stdin,
+	crlfDelay: Infinity
+});
+rl.on("line", handleConsoleLine);
 
 function stopRconLifecycle() {
 	attemptId++;
@@ -213,7 +226,10 @@ function payloadsFromFrame(data) {
 	}
 }
 
-const handleRconMessage = createRconMessageHandler(payloadsFromFrame);
+const handleRconMessage = createRconMessageHandler(payloadsFromFrame, {
+	tracker: rconTracker,
+	write: writePanel
+});
 
 var poll = function () {
 	if (exited || dialing || activeSocket) return;
@@ -276,26 +292,15 @@ var poll = function () {
 			writePanel("Reconnected to RCON.");
 		}
 
-		// Hack to fix broken console output
+		// Hack to fix broken console output (kept untracked with Identifier -1)
 		try { ws.send(createPacket("status")); } catch (e) {}
-
-		process.stdin.removeListener("data", initialListener);
-		if (!stdinHooked) {
-			stdinHooked = true;
-			process.stdin.on("data", function (text) {
-				if (consoleSocket && consoleSocket.readyState === 1) {
-					try { consoleSocket.send(createPacket(text)); } catch (e) {}
-				} else if (String(text).trim() === "quit") {
-					gameProcess.kill("SIGTERM");
-				}
-			});
-		}
 	});
 
 	ws.on("message", function (data) {
 		if (ws !== consoleSocket) return;
-		// Parse frames to validate RCON traffic, but never mirror game payloads.
-		// Rust child stdout/stderr already provide the panel's complete game log.
+		// Only print replies matching positive tracked command Identifiers.
+		// Broadcast frames (Identifier <= 0) are ignored because child stdout/stderr
+		// already provide the panel's complete game log.
 		handleRconMessage(data);
 	});
 
