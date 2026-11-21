@@ -6,7 +6,15 @@ const {
 	createGameOutputHandler,
 	createRconCommandTracker,
 	createRconMessageHandler,
-	createConsoleInputHandler
+	createConsoleInputHandler,
+	createTimestampedLogWriter,
+	createLogLineDeduper,
+	expandLogFilePath,
+	formatLogTimestamp,
+	formatPosixDate,
+	hasLogTimestamp,
+	retargetUnityLogfile,
+	stampLogLines
 } = require("./wrapper-helpers");
 
 const output = [];
@@ -205,6 +213,64 @@ const noEchoInput = createConsoleInputHandler({
 assert.strictEqual(noEchoInput("time"), true);
 assert.deepStrictEqual(noEchoOut, []);
 
+// Every delivered line gets one timestamp, including text that is shown on the console.
+const fixedNow = new Date(2026, 10, 15, 21, 4, 5);
+assert.strictEqual(formatLogTimestamp(fixedNow), "2026-11-15 21:04:05");
+assert.strictEqual(
+	expandLogFilePath("logs/$(date +%Y-%m-%d-%H%M).log", (format) => formatPosixDate(format, fixedNow)),
+	"logs/2026-11-15-2104.log"
+);
+assert.strictEqual(expandLogFilePath("   ", () => "unused"), "");
+assert.strictEqual(expandLogFilePath("logs/console.log", () => {
+	throw new Error("date should not run");
+}), "logs/console.log");
+
+const stamped = [];
+const writeStamped = createTimestampedLogWriter({
+	now: () => fixedNow,
+	writeLine: (line) => stamped.push(line)
+});
+writeStamped("Server startup complete");
+writeStamped("hostname: My Rust Server\nplayers : 12");
+writeStamped("");
+assert.deepStrictEqual(stamped, [
+	"2026-11-15 21:04:05 Server startup complete\n",
+	"2026-11-15 21:04:05 hostname: My Rust Server\n2026-11-15 21:04:05 players : 12\n"
+]);
+writeStamped("2026-11-15 21:04:05 Server startup complete");
+assert.strictEqual(stamped.at(-1), "2026-11-15 21:04:05 Server startup complete\n");
+assert.ok(stampLogLines("Server startup complete", fixedNow)[0].includes("Server startup complete"));
+assert.strictEqual(hasLogTimestamp("2026-11-15 21:04:05 Server startup complete"), true);
+assert.strictEqual(hasLogTimestamp("Server startup complete"), false);
+
+const retargeted = retargetUnityLogfile(
+	'./RustDedicated -batchmode -logfile logs/$(date +%Y-%m-%d-%H%M).log ${ADDITIONAL_ARGS}'
+);
+assert.strictEqual(retargeted.unityLogPath, "logs/$(date +%Y-%m-%d-%H%M).log");
+assert.match(retargeted.startup, /-logfile - \$\{ADDITIONAL_ARGS\}$/);
+assert.doesNotMatch(retargeted.startup, /-logfile logs\//);
+const alreadyStdout = retargetUnityLogfile("./RustDedicated -logfile -");
+assert.strictEqual(alreadyStdout.unityLogPath, "");
+assert.strictEqual(alreadyStdout.startup, "./RustDedicated -logfile -");
+
+const acceptLogLine = createLogLineDeduper();
+const delivered = [];
+function deliver(source, line) {
+	if (!acceptLogLine(source, line)) return;
+	delivered.push(source + ":" + line);
+}
+deliver("stdout", "Server startup complete");
+deliver("file", "Server startup complete");
+deliver("stdout", "Processing World");
+deliver("stdout", "Processing World");
+deliver("file", "only in the unity log");
+assert.deepStrictEqual(delivered, [
+	"stdout:Server startup complete",
+	"stdout:Processing World",
+	"stdout:Processing World",
+	"file:only in the unity log"
+]);
+
 // Static integration guardrails for the wrapper's actual child, stdin, and RCON paths.
 const wrapper = fs.readFileSync(require.resolve("./wrapper"), "utf8");
 assert.match(wrapper, /stdio:\s*\[['"]ignore['"],\s*['"]pipe['"],\s*['"]pipe['"]\]/);
@@ -217,6 +283,29 @@ assert.doesNotMatch(wrapper, /json\.Message|panel\.rcon|appendFile\(["']latest\.
 assert.match(wrapper, /createRconCommandTracker\(/);
 assert.match(wrapper, /createConsoleInputHandler\(/);
 assert.match(wrapper, /rl\.on\("line",\s*handleConsoleLine\)/);
+assert.match(wrapper, /const writePanel = \(text\) => emitShared\("stdout", text\);/);
+assert.match(wrapper, /console\.log\(block\);/);
+assert.match(wrapper, /retargetUnityLogfile\(startupCmd\)/);
+assert.match(wrapper, /followUnityLog\(unityLogPath\)/);
+assert.match(wrapper, /if \(!line \|\| hasLogTimestamp\(line\)\) continue;/);
+
+const egg = JSON.parse(fs.readFileSync("./egg-rust--all-in-one4-0.json", "utf8"));
+assert.strictEqual(egg.name, "Rust - All In One 4.0");
+assert.strictEqual(
+	egg.meta.update_url,
+	"https://raw.githubusercontent.com/evlaar-online/aioegg/master/egg-rust--all-in-one4-0.json"
+);
+assert.ok(egg.docker_images["ghcr.io/evlaar-online/aioegg:production"]);
+assert.ok(egg.docker_images["ghcr.io/sturdystubs/aioegg:production"]);
+assert.match(egg.startup, /-logfile - /);
+assert.doesNotMatch(egg.startup, /LOG_FILE/);
+assert.doesNotMatch(egg.startup, /-logfile \/dev\/null/);
+const logFile = egg.variables.find((variable) => variable.env_variable === "LOG_FILE");
+assert.match(logFile.description, /panel console/);
+assert.match(logFile.description, /log file/);
+
+const workflow = fs.readFileSync("./.github/workflows/publish.yml", "utf8");
+assert.match(workflow, /aioegg:production/);
 
 // RCON close/error only schedule reconnects; they never terminate the wrapper.
 const rconLifecycle = wrapper.slice(

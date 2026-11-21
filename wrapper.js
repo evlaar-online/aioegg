@@ -3,13 +3,86 @@
 var startupCmd = "";
 const fs = require("fs");
 const readline = require("readline");
+const path = require("path");
 const {
 	createGameOutputHandler,
 	createRconCommandTracker,
 	createRconMessageHandler,
-	createConsoleInputHandler
+	createConsoleInputHandler,
+	createLogLineDeduper,
+	expandLogFilePath,
+	formatPosixDate,
+	hasLogTimestamp,
+	retargetUnityLogfile,
+	stampLogLines,
+	unstampedLogLine
 } = require("./wrapper-helpers");
-const writePanel = (text) => console.log(text);
+
+// Every line that reaches the wrapper gets one YYYY-MM-DD HH:MM:SS prefix.
+// That same line is printed to the panel and, when LOG_FILE is set, appended to the file.
+let consoleLogFd = null;
+let unityLogTimer = null;
+function closeConsoleLog() {
+	stopUnityLogFollow();
+	if (consoleLogFd == null) return;
+	const fd = consoleLogFd;
+	consoleLogFd = null;
+	try { fs.closeSync(fd); } catch (e) {}
+}
+
+function openConsoleLog() {
+	let logPath = "";
+	try {
+		logPath = expandLogFilePath(process.env.LOG_FILE, (format) => formatPosixDate(format, new Date()));
+	} catch (e) {
+		console.log("Console log path is invalid: " + (e && e.message ? e.message : e));
+		return () => {};
+	}
+	if (!logPath) return () => {};
+
+	try {
+		const dir = path.dirname(logPath);
+		if (dir && dir !== ".") fs.mkdirSync(dir, { recursive: true });
+		consoleLogFd = fs.openSync(logPath, "a");
+	} catch (e) {
+		consoleLogFd = null;
+		console.log("Failed to open console log " + logPath + ": " + (e && e.message ? e.message : e));
+		return () => {};
+	}
+
+	let failed = false;
+	return function writeRawLog(text) {
+		if (failed || consoleLogFd == null || !text) return;
+		try {
+			fs.writeSync(consoleLogFd, text);
+		} catch (err) {
+			failed = true;
+			console.log("Console log write failed: " + (err && err.message ? err.message : err));
+		}
+	};
+}
+
+const writeRawLog = openConsoleLog();
+const acceptLogLine = createLogLineDeduper();
+
+function emitShared(source, text) {
+	const now = new Date();
+	const parts = String(text == null ? "" : text).replace(/\r/g, "").split("\n");
+	const stamped = [];
+	for (let i = 0; i < parts.length; i++) {
+		const part = parts[i];
+		if (!part) continue;
+		if (!acceptLogLine(source, unstampedLogLine(part))) continue;
+		const lines = stampLogLines(part, now);
+		if (lines.length) stamped.push(lines[0]);
+	}
+	if (!stamped.length) return;
+	const block = stamped.join("\n");
+	console.log(block);
+	writeRawLog(block + "\n");
+}
+
+const writePanel = (text) => emitShared("stdout", text);
 
 var args = process.argv.splice(process.execArgv.length + 2);
 for (var i = 0; i < args.length; i++) {
@@ -22,8 +95,15 @@ for (var i = 0; i < args.length; i++) {
 
 if (startupCmd.length < 1) {
 	writePanel("Error: Please specify a startup command.");
+	closeConsoleLog();
 	process.exit();
 }
+
+// A real -logfile path makes Unity skip stdout. Log to stdout instead, and follow
+// the old file in case Unity still writes the player log there.
+const retargetedLog = retargetUnityLogfile(startupCmd);
+startupCmd = retargetedLog.startup;
+const unityLogPath = expandLogFilePath(retargetedLog.unityLogPath, (format) => formatPosixDate(format, new Date()));
 
 const seenPercentage = {};
 
@@ -87,6 +167,54 @@ const spawnArgs = usePty
     ? ['-qfec', startupCmd, '/dev/null']
     : ['-lc', startupCmd];
 
+function stopUnityLogFollow() {
+	if (!unityLogTimer) return;
+	clearInterval(unityLogTimer);
+	unityLogTimer = null;
+}
+
+function followUnityLog(logPath) {
+	if (!logPath || logPath === "-" || logPath === "/dev/null") return;
+	let offset = 0;
+	let remainder = "";
+	try { offset = fs.statSync(logPath).size; } catch (e) { offset = 0; }
+	unityLogTimer = setInterval(() => {
+		let stat;
+		try { stat = fs.statSync(logPath); } catch (e) { return; }
+		if (stat.size < offset) {
+			offset = 0;
+			remainder = "";
+		}
+		if (stat.size === offset) return;
+		let fd = null;
+		try {
+			fd = fs.openSync(logPath, "r");
+			const len = stat.size - offset;
+			const buf = Buffer.alloc(len);
+			fs.readSync(fd, buf, 0, len, offset);
+			offset = stat.size;
+			remainder += buf.toString("utf8");
+		} catch (e) {
+			return;
+		} finally {
+			if (fd != null) {
+				try { fs.closeSync(fd); } catch (e) {}
+			}
+		}
+		let newline = remainder.indexOf("\n");
+		while (newline !== -1) {
+			const line = remainder.slice(0, newline).replace(/\r$/, "");
+			remainder = remainder.slice(newline + 1);
+			newline = remainder.indexOf("\n");
+			if (!line || hasLogTimestamp(line)) continue;
+			emitShared("file", line);
+		}
+	}, 250);
+	if (unityLogTimer.unref) unityLogTimer.unref();
+}
+
+followUnityLog(unityLogPath);
+
 const gameProcess = spawn(spawnCmd, spawnArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: process.env
@@ -116,14 +244,16 @@ gameProcess.on('exit', function (code, signal) {
     }
 	try { rl.close(); } catch {}
 	process.stdin.pause();
+	closeConsoleLog();
 	process.exitCode = typeof code === "number" ? code : 1;
 });
 
 process.on('exit', function (code) {
-	if (exited) return;
-
-	writePanel("Received request to stop the process, stopping the game...");
-	gameProcess.kill('SIGTERM');
+	if (!exited) {
+		writePanel("Received request to stop the process, stopping the game...");
+		gameProcess.kill('SIGTERM');
+	}
+	closeConsoleLog();
 });
 
 function createPacket(command, identifier) {
